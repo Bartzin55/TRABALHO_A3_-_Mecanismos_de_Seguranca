@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚨 DDoS | Cibersegurança</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+    <header>
+        <div class="nav-container">
+            <div class="logo"><a href="index.html">🔒 CiberDefesa</a></div>
+            <nav>
+                <a href="index.html">Home</a>
+                <a href="fundamentos.html">Fundamentos</a>
+                <a href="mecanismos.html">Mecanismos</a>
+                <a href="ddos.html" class="active">Ataques DDoS</a>
+                <a href="monitoramento.html">Monitoramento</a>
+            </nav>
+        </div>
+    </header>
+
+    <div class="container">
+
+        <section>
+            <h2>Ataques de Negação de Serviço Distribuído (DDoS)</h2>
+            <p>O ataque DDoS é uma das maiores ameaças ao pilar da Disponibilidade, visando derrubar um serviço ou site online.</p>
+
+            <div class="alert-box">
+                <h3>Definição</h3>
+                <p>O DDoS ocorre quando um atacante coordena uma vasta rede de dispositivos comprometidos (conhecidos como *botnets*) para lançar um volume massivo e coordenado de tráfego contra um alvo específico, tornando-o inacessível para usuários legítimos.</p>
+            </div>
+            
+            <h3>Como Acontece o Ataque</h3>
+            <ul>
+                <li>Recrutamento: Malware infecta milhares de computadores, servidores e dispositivos IoT, transformando-os em "bots" controlados remotamente.</li>
+                <li>Inundação (Flood): O atacante instrui a *botnet* a enviar simultaneamente milhões de requisições ou pacotes de dados para o alvo.</li>
+                <li>Saturação: O servidor alvo, com capacidade limitada de processamento ou largura de banda, fica sobrecarregado e incapaz de responder ao tráfego legítimo, culminando na negação do serviço.</li>
+            </ul>
+
+            <h3>Estratégias de Mitigação</h3>
+            <p>A defesa contra DDoS requer soluções que atuam fora do servidor de origem:</p>
+            <ul>
+                <li>Serviços de Mitigação Baseados em Nuvem (CDNs): Empresas como Cloudflare ou Akamai utilizam suas vastas redes globais para absorver e filtrar o tráfego malicioso antes que ele chegue ao servidor real.</li>
+                <li>Rate Limiting: Configuração de rede para limitar a taxa de requisições que podem vir de uma única fonte (IP), protegendo contra inundações simples.</li>
+                <li>Blackholing/Filtering: Em casos extremos, direcionar o tráfego do ataque para um "buraco negro" (blackhole) para evitar que ele afete o restante da rede (sacrificando, temporariamente, o alvo do ataque).</li>
+            </ul>
+        </section>
+
+    </div>
+
+</body>
+
+</html>
+
