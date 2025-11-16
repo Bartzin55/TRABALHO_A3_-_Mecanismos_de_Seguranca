@@ -32,7 +32,7 @@ def collect_metrics():
     global prev_net, prev_ts
 
     ts = int(time.time())
-    cpu = psutil.cpu_percent(interval=None)
+    cpu = psutil.cpu_percent(interval=1)
     mem = psutil.virtual_memory()
 
     # conexões TCP
