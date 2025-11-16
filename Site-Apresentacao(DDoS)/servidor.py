@@ -1,48 +1,58 @@
-# servidor.py
+# servidor.py (ATUALIZADO)
 from flask import Flask, jsonify, send_from_directory
 import psutil, time, os, csv
 from threading import Lock
 
-# Ajuste: a pasta que contém seus HTML/CSS é "site"
 STATIC_DIR = "site"
 PORT = 8080
 CSV_FILE = "metrics.csv"
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 
-# Garantir lock ao escrever CSV
 csv_lock = Lock()
 
-# Inicialização do CSV (cabeçalho)
+# Inicialização do CSV
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["ts","cpu_percent","memory_percent","memory_used_mb","memory_total_mb",
-                    "tcp_established","bytes_sent","bytes_recv"])
+        w.writerow([
+            "ts","cpu_percent","memory_percent","memory_used_mb","memory_total_mb",
+            "tcp_established","bytes_sent","bytes_recv","network_usage_percent"
+        ])
 
-# estado para calcular bytes/s
+# Para cálculo de bytes/s
 prev_net = psutil.net_io_counters()
 prev_ts = time.time()
 
+# Capacidade teórica da placa de rede (em bytes por segundo)
+# 1 Gbps = 125 MB/s ≈ 125_000_000 bytes/s
+NIC_CAPACITY = 125_000_000
+
 def collect_metrics():
     global prev_net, prev_ts
+
     ts = int(time.time())
-    # cpu com pequeno intervalo para valor mais confiável
     cpu = psutil.cpu_percent(interval=0.05)
     mem = psutil.virtual_memory()
 
-    # contar conexões TCP ESTABLISHED (pode requerer permissões em alguns SO)
+    # conexões TCP
     try:
         conns = psutil.net_connections(kind='inet')
         tcp_est = sum(1 for c in conns if c.status == 'ESTABLISHED')
-    except Exception:
+    except:
         tcp_est = -1
 
+    # rede
     net = psutil.net_io_counters()
     now = time.time()
     delta = max(1e-6, now - prev_ts)
+
     bytes_sent_per_s = (net.bytes_sent - prev_net.bytes_sent) / delta
     bytes_recv_per_s = (net.bytes_recv - prev_net.bytes_recv) / delta
+
+    total_bps = bytes_sent_per_s + bytes_recv_per_s
+    usage_percent = min(100, (total_bps / NIC_CAPACITY) * 100)
+
     prev_net = net
     prev_ts = now
 
@@ -54,46 +64,41 @@ def collect_metrics():
         "memory_total_mb": round(mem.total/1024/1024,2),
         "tcp_established": tcp_est,
         "bytes_sent_per_s": round(bytes_sent_per_s,1),
-        "bytes_recv_per_s": round(bytes_recv_per_s,1)
+        "bytes_recv_per_s": round(bytes_recv_per_s,1),
+        "network_usage_percent": round(usage_percent,1)
     }
 
-    # grava CSV (append)
+    # salva CSV
     try:
         with csv_lock:
             with open(CSV_FILE, "a", newline="") as f:
                 w = csv.writer(f)
-                w.writerow([ts, metrics["cpu_percent"], metrics["memory_percent"],
-                            metrics["memory_used_mb"], metrics["memory_total_mb"],
-                            metrics["tcp_established"], net.bytes_sent, net.bytes_recv])
-    except Exception as e:
-        # não quebrar a rota se escrever falhar
-        print("Warning: falha ao escrever CSV:", e)
+                w.writerow([
+                    ts, cpu, mem.percent,
+                    metrics["memory_used_mb"], metrics["memory_total_mb"],
+                    tcp_est, net.bytes_sent, net.bytes_recv,
+                    metrics["network_usage_percent"]
+                ])
+    except:
+        pass
 
     return metrics
 
 @app.route("/status")
 def status():
-    """Retorna métricas em JSON (utilizar no frontend)."""
-    m = collect_metrics()
-    return jsonify(m)
+    return jsonify(collect_metrics())
 
-# Rotas para servir arquivos estáticos (já coberto pelo static_folder),
-# ainda assim deixamos rota raiz para index.html
 @app.route("/")
 def index():
-    return send_from_directory(STATIC_DIR, "index.html")
+    return send_from_directory(STATIC_DIR, "monitoramento.html")
 
-# fornecer acesso direto a outras páginas (opcional)
 @app.route("/<path:pth>")
-def static_proxy(pth):
-    # segurança leve: serve apenas arquivos que existem dentro STATIC_DIR
+def proxy(pth):
     full = os.path.join(STATIC_DIR, pth)
     if os.path.exists(full) and os.path.isfile(full):
         return send_from_directory(STATIC_DIR, pth)
-    # fallback para index
-    return send_from_directory(STATIC_DIR, "index.html")
+    return send_from_directory(STATIC_DIR, "monitoramento.html")
 
 if __name__ == "__main__":
-    print(f"Rodando servidor em http://0.0.0.0:{PORT}  (servindo pasta: {STATIC_DIR})")
-    # debug=False para produção; use reloader desligado em demos
+    print(f"Servidor em http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, threaded=True)

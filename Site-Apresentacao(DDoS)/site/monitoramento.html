@@ -76,6 +76,14 @@
             </div>
 
             <div class="metric-row" style="margin-bottom:12px">
+              <div class="metric-label">Rede</div>
+              <div class="bar-wrap">
+                <div id="netFill2" class="bar-fill" style="background:linear-gradient(90deg,#3b82f6,#60a5fa)"></div>
+              </div>
+              <div style="width:64px;text-align:right" id="netValue2" class="small-muted">—%</div>
+            </div>
+
+            <div class="metric-row" style="margin-bottom:12px">
               <div class="metric-label">Conexões</div>
               <div style="flex:1"><div id="connValue" class="small-muted">—</div></div>
               <div style="width:64px;text-align:right" id="connLabel" class="small-muted">EST</div>
@@ -108,6 +116,7 @@ let labels = Array(MAX).fill('');
 let dataCpu = Array(MAX).fill(null);
 let dataMem = Array(MAX).fill(null);
 let dataConn = Array(MAX).fill(null);
+let dataNet = Array(MAX).fill(null);
 
 const ctx = document.getElementById('miniChart').getContext('2d');
 const miniChart = new Chart(ctx, {
@@ -117,7 +126,8 @@ const miniChart = new Chart(ctx, {
     datasets: [
       { label: 'CPU %', data: dataCpu.slice(), borderColor: 'rgba(220,38,38,0.95)', tension:0.25, borderWidth:2, pointRadius:0, fill:false },
       { label: 'Mem %', data: dataMem.slice(), borderColor: 'rgba(16,185,129,0.95)', tension:0.25, borderWidth:2, pointRadius:0, fill:false },
-      { label: 'Conexões', data: dataConn.slice(), borderColor: 'rgba(248,113,113,0.85)', tension:0.25, borderWidth:2, pointRadius:0, fill:false, hidden:true }
+      { label: 'Conexões', data: dataConn.slice(), borderColor: 'rgba(248,113,113,0.85)', tension:0.25, borderWidth:2, pointRadius:0, fill:false },
+      { label: 'Rede %', data: dataNet.slice(), borderColor: 'rgba(59,130,246,0.95)', tension: 0.25, borderWidth: 2, pointRadius: 0, fill: false }
     ]
   },
   options: {
@@ -145,7 +155,11 @@ async function updateOnce(){
     const mem = (m.memory_percent !== undefined) ? m.memory_percent : 0;
     const conn = (m.tcp_established >= 0) ? m.tcp_established : null;
     const net = (m.bytes_sent_per_s !== undefined && m.bytes_recv_per_s !== undefined) ? ((m.bytes_sent_per_s + m.bytes_recv_per_s)/2) : null;
+    const usage = (m.network_usage_percent !== undefined) ? m.network_usage_percent : 0;
+    const netPercent = (m.network_usage_percent !== undefined) ? m.network_usage_percent : 0;
 
+    document.getElementById('netFill2').style.width = Math.min(100, usage) + '%';
+    document.getElementById('netValue2').textContent = usage.toFixed(1) + '%';
     document.getElementById('cpuFill').style.width = Math.min(100,cpu)+'%';
     document.getElementById('cpuValue').textContent = cpu.toFixed(1)+'%';
     document.getElementById('memFill').style.width = Math.min(100,mem)+'%';
@@ -159,11 +173,13 @@ async function updateOnce(){
     pushValue(dataCpu, cpu);
     pushValue(dataMem, mem);
     pushValue(dataConn, conn);
+    pushValue(dataNet, netPercent);
 
     miniChart.data.labels = Array.from({length:dataCpu.length}, (_,i)=>'');
     miniChart.data.datasets[0].data = dataCpu.slice();
     miniChart.data.datasets[1].data = dataMem.slice();
     miniChart.data.datasets[2].data = dataConn.slice();
+    miniChart.data.datasets[3].data = dataNet.slice();
     miniChart.update('none');
 
   } catch(err){
@@ -182,3 +198,5 @@ setInterval(updateOnce, 1000);
 
 </body>
 </html>
+
+
