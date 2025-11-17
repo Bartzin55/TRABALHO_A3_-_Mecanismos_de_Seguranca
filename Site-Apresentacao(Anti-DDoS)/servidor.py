@@ -4,6 +4,7 @@
 # - Adiciona regra nft: ip saddr <IP> drop  (ban no kernel)
 # - Mantém collector em background, CSV, NIC detection, /status e pasta site
 
+import sys
 import os
 import time
 import csv
@@ -16,6 +17,10 @@ from collections import defaultdict, deque
 from flask import Flask, jsonify, send_from_directory, request, abort
 
 import psutil
+
+if os.geteuid() != 0:
+    print("Este servidor precisa ser executado como root (sudo).")
+    sys.exit(1)
 
 # ---------------- CONFIG ----------------
 STATIC_DIR = "site"
@@ -93,9 +98,9 @@ def ensure_nft_table_chain():
         p = subprocess.run(["nft", "list", "table", "inet", "filter"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if p.returncode != 0:
-            subprocess.run(["sudo", "nft", "add", "table", "inet", "filter"], check=False)
+            subprocess.run(["nft", "add", "table", "inet", "filter"], check=False)
             subprocess.run([
-                "sudo", "nft", "add", "chain", "inet", "filter", "input",
+                "nft", "add", "chain", "inet", "filter", "input",
                 "{", "type", "filter", "hook", "input", "priority", "0;", "}"
             ], check=False)
             logging.info("Criada tabela/chain nft inet filter (criação automática).")
@@ -113,7 +118,7 @@ def nft_block_ip(ip):
         return False
 
     try:
-        cmd = ["sudo", "nft", "add", "rule", "inet", "filter", "input", "ip", "saddr", ip, "drop"]
+        cmd = ["nft", "add", "rule", "inet", "filter", "input", "ip", "saddr", ip, "drop"]
         subprocess.run(cmd, check=False)
         logging.info("Bloqueado no kernel (nft): %s", ip)
         return True
