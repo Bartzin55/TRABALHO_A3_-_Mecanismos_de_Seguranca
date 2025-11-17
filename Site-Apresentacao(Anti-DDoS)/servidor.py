@@ -43,13 +43,13 @@ def nft_block_ip(ip):
     """Bloqueia o IP no firewall (DROP) de forma permanente."""
     if ip.startswith("127.") or ip == "localhost":
         return  # nunca bloquear localhost
-
     try:
         cmd = [
             "sudo", "nft", "add", "rule", "inet", "filter", "input",
             "ip", "saddr", ip, "drop"
         ]
         subprocess.run(cmd, stderr=subprocess.DEVNULL)
+        os.system(f"nft add rule inet filter input ip saddr {ip} drop")
         logging.warning(f"[FIREWALL] IP bloqueado via nftables: {ip}")
     except Exception as e:
         logging.error(f"Erro ao bloquear IP no nftables: {e}")
