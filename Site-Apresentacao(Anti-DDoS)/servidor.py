@@ -1,117 +1,148 @@
-# servidor_defesa.py
-"""
-Servidor Flask com defesa simples contra floods:
-- rate limiting por IP (janela deslizante)
-- limite de requisições simultâneas por IP
-- blacklist temporária para IPs que exageram
-- coleta de métricas (psutil) e gravação em CSV (metrics.csv)
+#!/usr/bin/env python3
+# servidor.py com mitigação simples de DDoS (token-bucket + blacklist + conn limit)
+# Mantém: coletor em background, CSV, detecção NIC, /status e servir pasta site.
+# Baseado no servidor anterior que você tinha. Referência: arquivo anterior. :contentReference[oaicite:1]{index=1}
 
-Boa para demonstração em rede isolada (laboratório).
-Não substitui mitigação profissional (nginx + iptables + CDN).
-"""
-
-from flask import Flask, jsonify, send_from_directory, request, make_response
+from flask import Flask, jsonify, send_from_directory, request, abort, make_response
 import psutil, time, os, csv
-from threading import Lock
-from collections import deque, defaultdict
+from threading import Lock, Thread
+from collections import defaultdict
+import logging
 
+# ----------------- CONFIGURAÇÃO -----------------
 STATIC_DIR = "site"
 PORT = 8080
 CSV_FILE = "metrics.csv"
 
+# Mitigação
+RATE_BASE = 5.0         # tokens por segundo permitidos por IP (sustained)
+RATE_BURST = 20.0       # tokens máximos (burst)
+BLACKLIST_THRESHOLD = 5 # quantas violações antes de ban temporário
+BLACKLIST_SECONDS = 300 # tempo de bloqueio em segundos (5 min)
+CONCURRENT_LIMIT = 10   # conexões simultâneas permitidas por IP
+
+COLLECT_INTERVAL = 1.0  # segundos entre coletas
+
+# log básico
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 
-# ---------- defesa: parâmetros (ajuste para a demo) ----------
-RATE_WINDOW_SECONDS = 10        # janela para contar requests
-RATE_MAX_REQUESTS = 12          # max requests por janela por IP
-CONN_LIMIT_PER_IP = 6           # max requisições simultâneas por IP
-GLOBAL_CONCURRENT_LIMIT = 80    # limite global simultâneo (proteção básica)
-BAN_THRESHOLD = 4               # quantas vezes excedeu o limite que vira ban
-BAN_SECONDS = 120               # ban temporário (2 minutos)
-# --------------------------------------------------------------
+# Locks
+csv_lock = Lock()
+metrics_lock = Lock()
+rl_lock = Lock()
+conn_lock = Lock()
 
-# estruturas em memória (thread-safe com locks)
-ip_request_times = defaultdict(lambda: deque())  # ip -> deque of timestamps
-ip_active_requests = defaultdict(int)           # ip -> int active requests
-ip_excess_counts = defaultdict(int)             # ip -> count of violations
-banned_ips = {}                                  # ip -> expire_timestamp
-
-global_active_lock = Lock()
-global_active_requests = 0
-
-data_lock = Lock()  # para escrever CSV e manipular estruturas
+# Snapshot de métricas (inicial)
+_latest_metrics = {
+    "timestamp": int(time.time()),
+    "cpu_percent": 0.0,
+    "memory_percent": 0.0,
+    "memory_used_mb": 0.0,
+    "memory_total_mb": 0.0,
+    "tcp_established": -1,
+    "bytes_sent_per_s": 0.0,
+    "bytes_recv_per_s": 0.0,
+    "network_usage_percent": 0.0
+}
 
 # CSV init
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["ts","cpu_percent","memory_percent","memory_used_mb","memory_total_mb",
-                    "tcp_established","bytes_sent","bytes_recv"])
+        w.writerow([
+            "ts","cpu_percent","memory_percent","memory_used_mb","memory_total_mb",
+            "tcp_established","bytes_sent","bytes_recv","network_usage_percent"
+        ])
 
-# estado para bytes/s
-prev_net = psutil.net_io_counters()
-prev_ts = time.time()
+# net counters para cálculo de bytes/s
+_prev_net = psutil.net_io_counters()
+_prev_ts = time.time()
 
-def client_ip():
-    """Pega IP do cliente de forma básica; suporta X-Real-IP se estiver atrás de proxy."""
-    x = request.headers.get("X-Real-IP") or request.headers.get("X-Forwarded-For")
-    if x:
-        # X-Forwarded-For pode conter lista
-        return x.split(",")[0].strip()
-    return request.remote_addr or "unknown"
+# detectar NIC capacity (Mbps -> bytes/s)
+def detectar_capacidade_nic():
+    try:
+        stats = psutil.net_if_stats()
+        for name, st in stats.items():
+            if st.isup and st.speed and st.speed > 0:
+                return int(st.speed * 125_000)  # Mbps -> bytes/s
+    except Exception:
+        pass
+    return 125_000_000  # fallback 1Gbps
 
-def is_banned(ip):
+NIC_CAPACITY = detectar_capacidade_nic()
+
+# ----------------- CONTROLE DE RATE-LIMIT (token bucket) -----------------
+# Estruturas: tokens[ip] = (tokens, last_ts)
+tokens = {}
+violations = defaultdict(int)
+blacklist = {}           # ip -> unblock_ts
+concurrent_conns = defaultdict(int)  # ip -> conexões ativas
+
+def allow_request(ip):
+    """Retorna True se a requisição é permitida, False se deve ser bloqueada."""
     now = time.time()
-    exp = banned_ips.get(ip)
-    if exp and exp > now:
+    with rl_lock:
+        # blacklist check
+        if ip in blacklist:
+            if now < blacklist[ip]:
+                return False
+            else:
+                del blacklist[ip]
+                violations[ip] = 0
+
+        tok, last = tokens.get(ip, (RATE_BURST, now))
+        # regen tokens
+        elapsed = now - last
+        tok = min(RATE_BURST, tok + elapsed * RATE_BASE)
+        if tok >= 1.0:
+            tok -= 1.0
+            tokens[ip] = (tok, now)
+            return True
+        else:
+            # violação
+            tokens[ip] = (tok, now)
+            violations[ip] += 1
+            if violations[ip] >= BLACKLIST_THRESHOLD:
+                blacklist[ip] = now + BLACKLIST_SECONDS
+                logging.warning(f"Blacklisted {ip} for {BLACKLIST_SECONDS}s (violations={violations[ip]})")
+            return False
+
+def conn_acquire(ip):
+    with conn_lock:
+        if concurrent_conns[ip] >= CONCURRENT_LIMIT:
+            return False
+        concurrent_conns[ip] += 1
         return True
-    if exp and exp <= now:
-        # ban expirou
-        with data_lock:
-            banned_ips.pop(ip, None)
-            ip_excess_counts.pop(ip, None)
-        return False
-    return False
 
-def register_request_time(ip):
-    now = time.time()
-    dq = ip_request_times[ip]
-    dq.append(now)
-    # pop old timestamps
-    while dq and (now - dq[0] > RATE_WINDOW_SECONDS):
-        dq.popleft()
+def conn_release(ip):
+    with conn_lock:
+        if concurrent_conns[ip] > 0:
+            concurrent_conns[ip] -= 1
 
-def rate_exceeded(ip):
-    dq = ip_request_times[ip]
-    return len(dq) > RATE_MAX_REQUESTS
-
-def record_excess(ip):
-    # incrementa contador de excessos; se ultrapassar BAN_THRESHOLD, bane
-    ip_excess_counts[ip] += 1
-    if ip_excess_counts[ip] >= BAN_THRESHOLD:
-        banned_until = time.time() + BAN_SECONDS
-        banned_ips[ip] = banned_until
-        return True
-    return False
-
-def collect_metrics():
-    """Coleta métricas e grava CSV (similar ao anterior)."""
-    global prev_net, prev_ts
+# ----------------- COLETOR EM BACKGROUND (mantido) -----------------
+def collect_once():
+    global _prev_net, _prev_ts
     ts = int(time.time())
-    cpu = psutil.cpu_percent(interval=0.03)
+    cpu = psutil.cpu_percent(interval=None)
     mem = psutil.virtual_memory()
+
     try:
         conns = psutil.net_connections(kind='inet')
         tcp_est = sum(1 for c in conns if c.status == 'ESTABLISHED')
     except Exception:
         tcp_est = -1
+
     net = psutil.net_io_counters()
     now = time.time()
-    delta = max(1e-6, now - prev_ts)
-    bytes_sent_per_s = (net.bytes_sent - prev_net.bytes_sent) / delta
-    bytes_recv_per_s = (net.bytes_recv - prev_net.bytes_recv) / delta
-    prev_net = net
-    prev_ts = now
+    delta = max(1e-6, now - _prev_ts)
+    bytes_sent_per_s = (net.bytes_sent - _prev_net.bytes_sent) / delta
+    bytes_recv_per_s = (net.bytes_recv - _prev_net.bytes_recv) / delta
+    total_bps = bytes_sent_per_s + bytes_recv_per_s
+    usage_percent = min(100.0, (total_bps / NIC_CAPACITY) * 100.0)
+    _prev_net = net
+    _prev_ts = now
 
     metrics = {
         "timestamp": ts,
@@ -121,127 +152,120 @@ def collect_metrics():
         "memory_total_mb": round(mem.total / 1024 / 1024, 2),
         "tcp_established": tcp_est,
         "bytes_sent_per_s": round(bytes_sent_per_s, 1),
-        "bytes_recv_per_s": round(bytes_recv_per_s, 1)
+        "bytes_recv_per_s": round(bytes_recv_per_s, 1),
+        "network_usage_percent": round(usage_percent, 1)
     }
 
-    # grava CSV (append)
+    # grava CSV de forma protegida
     try:
-        with data_lock:
+        with csv_lock:
             with open(CSV_FILE, "a", newline="") as f:
                 w = csv.writer(f)
-                w.writerow([ts, metrics["cpu_percent"], metrics["memory_percent"],
-                            metrics["memory_used_mb"], metrics["memory_total_mb"],
-                            metrics["tcp_established"], net.bytes_sent, net.bytes_recv])
+                w.writerow([
+                    ts,
+                    metrics["cpu_percent"],
+                    metrics["memory_percent"],
+                    metrics["memory_used_mb"],
+                    metrics["memory_total_mb"],
+                    tcp_est,
+                    net.bytes_sent,
+                    net.bytes_recv,
+                    metrics["network_usage_percent"]
+                ])
     except Exception as e:
-        print("Warning: falha ao escrever CSV:", e)
+        logging.warning("falha ao escrever CSV: %s", e)
 
-    return metrics
+    with metrics_lock:
+        _latest_metrics.update(metrics)
 
-# ---------- hooks que implementam as proteções ----------
-@app.before_request
-def before_request_protect():
-    global global_active_requests
-    ip = client_ip()
+def collector_loop(interval=COLLECT_INTERVAL):
+    # inicializa deltas
+    psutil.cpu_percent(interval=None)
+    global _prev_net, _prev_ts
+    _prev_net = psutil.net_io_counters()
+    _prev_ts = time.time()
+    while True:
+        try:
+            collect_once()
+        except Exception as e:
+            logging.warning("Collector warning: %s", e)
+        time.sleep(interval)
 
-    # permitir rota de arquivos estáticos sem proteção excessiva? Ainda protegemos tudo.
-    # checa lista de ban
-    if is_banned(ip):
-        # retorna 429
-        return make_response(("429 Too Many Requests (banned)", 429))
-
-    # controle global de concorrência
-    with global_active_lock:
-        if global_active_requests >= GLOBAL_CONCURRENT_LIMIT:
-            return make_response(("503 Service Unavailable (global concurrency limit)", 503))
-        global_active_requests += 1
-
-    # controle por-IP de requisições simultâneas
-    with data_lock:
-        ip_active_requests[ip] += 1
-        if ip_active_requests[ip] > CONN_LIMIT_PER_IP:
-            # registro de excesso
-            exceed = record_excess(ip)
-            # decrement global & ip counters antes de responder
-            with global_active_lock:
-                global_active_requests -= 1
-            ip_active_requests[ip] -= 1
-            if exceed:
-                msg = f"429 Too Many Requests - you have been temporarily banned for {BAN_SECONDS}s"
-                return make_response((msg, 429))
-            else:
-                # responder 429 com Retry-After simples
-                resp = make_response(("429 Too Many Requests - slow down", 429))
-                resp.headers['Retry-After'] = str(RATE_WINDOW_SECONDS)
-                return resp
-
-    # rate limiting por janela: registramos o tempo aqui (antes de processar)
-    with data_lock:
-        register_request_time(ip)
-        if rate_exceeded(ip):
-            # excedeu o limite de requests na janela -> conta excesso e talvez ban
-            exceed = record_excess(ip)
-            # desfazer incrementos acima antes de responder
-            with global_active_lock:
-                global_active_requests -= 1
-            ip_active_requests[ip] -= 1
-            if exceed:
-                return make_response((f"429 Too Many Requests - banned for {BAN_SECONDS}s", 429))
-            else:
-                resp = make_response(("429 Too Many Requests - rate limit", 429))
-                resp.headers['Retry-After'] = str(RATE_WINDOW_SECONDS)
-                return resp
-    # se chegou até aqui, request segue normalmente
-
-@app.after_request
-def after_request_cleanup(response):
-    # decrementa contadores de concorrência (se possível)
+# ----------------- CACHE SIMPLES DE INDEX -----------------
+_cached_index = None
+_cached_index_mtime = 0
+def cached_index():
+    global _cached_index, _cached_index_mtime
+    path = os.path.join(STATIC_DIR, "monitoramento.html")
     try:
-        ip = client_ip()
-        with data_lock:
-            if ip_active_requests.get(ip, 0) > 0:
-                ip_active_requests[ip] -= 1
+        mtime = os.path.getmtime(path)
+        if _cached_index is None or mtime != _cached_index_mtime:
+            with open(path, "rb") as f:
+                _cached_index = f.read()
+            _cached_index_mtime = mtime
     except Exception:
-        pass
-    with global_active_lock:
-        global global_active_requests
-        if global_active_requests > 0:
-            global_active_requests -= 1
+        _cached_index = None
+    return _cached_index
+
+# ----------------- MIDDLEWARE FLASK: antes de cada requisição -----------------
+@app.before_request
+def before_req():
+    # aceitar apenas GETs para páginas estáticas e /status
+    ip = request.remote_addr or "unknown"
+    # count concurrent connections (simple)
+    if not conn_acquire(ip):
+        logging.info("Conn limit exceeded for %s", ip)
+        abort(make_response("Too many concurrent connections", 429))
+
+    # aplicamos rate limiting apenas no endpoint /status (ponto crítico)
+    if request.path == "/status":
+        allowed = allow_request(ip)
+        if not allowed:
+            conn_release(ip)
+            abort(make_response("Rate limit exceeded or blacklisted", 429))
+
+# libera contagem de conexão após request (sempre)
+@app.after_request
+def after_req(response):
+    ip = request.remote_addr or "unknown"
+    conn_release(ip)
     return response
 
-# ---------- rotas ----------
+# ----------------- ROTAS -----------------
 @app.route("/status")
 def status():
-    """Rota de métricas (JSON)."""
-    m = collect_metrics()
-    return jsonify(m)
+    # retorna snapshot leve (rápido)
+    with metrics_lock:
+        return jsonify(dict(_latest_metrics))
 
 @app.route("/")
 def index():
-    return send_from_directory(STATIC_DIR, "index.html")
+    data = cached_index()
+    if data is not None:
+        return data, 200, {'Content-Type': 'text/html; charset=utf-8'}
+    # fallback: servir arquivo normalmente
+    return send_from_directory(STATIC_DIR, "monitoramento.html")
 
 @app.route("/<path:pth>")
-def static_proxy(pth):
-    # Serve arquivos estáticos da pasta site/
+def proxy(pth):
     full = os.path.join(STATIC_DIR, pth)
     if os.path.exists(full) and os.path.isfile(full):
         return send_from_directory(STATIC_DIR, pth)
-    return send_from_directory(STATIC_DIR, "index.html")
+    return send_from_directory(STATIC_DIR, "monitoramento.html")
 
-# ---------- utilitário para ver estado da defesa (apenas para debug/demo) ----------
-@app.route("/_debug/defense_status")
-def debug_defense_status():
-    """Mostra info resumida (JSON) sobre bloqueios - útil para slides."""
-    with data_lock:
-        now = time.time()
-        banned_list = {ip: int(exp - now) for ip, exp in banned_ips.items() if exp > now}
-        short = {
-            "global_active_requests": global_active_requests,
-            "banned_count": len(banned_list),
-            "banned_ips": banned_list,
-        }
-    return jsonify(short)
+# rota administrativa simples para ver blacklist (apenas para demo/local)
+@app.route("/_internal/blacklist")
+def show_blacklist():
+    # lista IPs atualmente bloqueados com tempo restante
+    now = time.time()
+    with rl_lock:
+        out = {ip: int(until - now) for ip, until in blacklist.items() if until > now}
+    return jsonify(out)
 
-# ---------- main ----------
+# ----------------- MAIN -----------------
 if __name__ == "__main__":
-    print(f"Rodando servidor com defesa simples em http://0.0.0.0:{PORT} (servindo pasta: {STATIC_DIR})")
+    t = Thread(target=collector_loop, args=(COLLECT_INTERVAL,), daemon=True)
+    t.start()
+    logging.info("Servidor rodando em http://0.0.0.0:%d (NIC cap ~ %d bytes/s)", PORT, NIC_CAPACITY)
+    # aceita conexões externas (0.0.0.0)
     app.run(host="0.0.0.0", port=PORT, threaded=True)
