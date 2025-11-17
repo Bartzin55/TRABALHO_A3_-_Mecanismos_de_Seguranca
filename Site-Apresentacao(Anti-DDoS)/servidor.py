@@ -9,6 +9,7 @@ import time
 import csv
 import logging
 import subprocess
+import shutil
 from threading import Lock, Thread
 from collections import defaultdict, deque
 
@@ -24,11 +25,9 @@ CSV_FILE = "metrics.csv"
 # Detecção de ataque (sliding window)
 WINDOW_SECONDS = 5         # janela para contar requisições
 THRESHOLD = 20             # requisições na janela => ban
-# (ajuste esses valores conforme seus testes)
 
 COLLECT_INTERVAL = 1.0     # segundos entre coletas do collector
 
-# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
@@ -41,13 +40,10 @@ banned_lock = Lock()
 _cached_index = None
 _cached_index_mtime = 0
 
-# sliding windows: ip -> deque(timestamps)
 req_windows = defaultdict(lambda: deque())
 
-# banned IPs (persistem em memória); rules also exist in nft
 banned_ips = set()
 
-# snapshot inicial
 _latest_metrics = {
     "timestamp": int(time.time()),
     "cpu_percent": 0.0,
@@ -69,7 +65,6 @@ if not os.path.exists(CSV_FILE):
             "tcp_established","bytes_sent","bytes_recv","network_usage_percent"
         ])
 
-# net counters para cálculo de bytes/s
 _prev_net = psutil.net_io_counters()
 _prev_ts = time.time()
 
@@ -88,29 +83,21 @@ NIC_CAPACITY = detectar_capacidade_nic()
 
 # ---------------- nft helpers ----------------
 def nft_available():
-    return bool(shutil_which("nft"))
-
-def shutil_which(cmd):
-    # minimal replacement for shutil.which to avoid extra import surprises
-    from shutil import which
-    return which(cmd)
+    return bool(shutil.which("nft"))
 
 def ensure_nft_table_chain():
-    """
-    Garante que tabela inet filter e chain input existam.
-    Executa comandos nft para criar quando necessário.
-    """
-    if not shutil_which("nft"):
-        logging.error("nft não encontrado no sistema. Instale nftables.")
+    if not nft_available():
+        logging.error("nft não encontrado no sistema.")
         return False
     try:
-        # verifica se a tabela existe
         p = subprocess.run(["nft", "list", "table", "inet", "filter"],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if p.returncode != 0:
-            # cria tabela e chain
             subprocess.run(["sudo", "nft", "add", "table", "inet", "filter"], check=False)
-            subprocess.run(["sudo", "nft", "add", "chain", "inet", "filter", "input", "{", "type", "filter", "hook", "input", "priority", "0;", "}"], check=False)
+            subprocess.run([
+                "sudo", "nft", "add", "chain", "inet", "filter", "input",
+                "{", "type", "filter", "hook", "input", "priority", "0;", "}"
+            ], check=False)
             logging.info("Criada tabela/chain nft inet filter (criação automática).")
         return True
     except Exception as e:
@@ -118,54 +105,45 @@ def ensure_nft_table_chain():
         return False
 
 def nft_block_ip(ip):
-    """
-    Bloqueia o IP no kernel via nftables (DROP).
-    Não tenta remover automaticamente (ban permanente).
-    """
-    # proteção básica: não bloquear localhost ou rede local gravemente
     if not ip or ip.startswith("127.") or ip == "localhost":
         logging.warning("Tentativa de bloquear IP local ignorada: %s", ip)
         return False
-    if not shutil_which("nft"):
+    if not nft_available():
         logging.error("nft não disponível; não é possível bloquear %s", ip)
         return False
+
     try:
-        # tenta adicionar a regra; usar subprocess com lista evita shell injection
-        cmd = f"sudo nft add rule inet filter input ip saddr {ip} drop"
-        os.system(cmd)
+        cmd = ["sudo", "nft", "add", "rule", "inet", "filter", "input", "ip", "saddr", ip, "drop"]
+        subprocess.run(cmd, check=False)
         logging.info("Bloqueado no kernel (nft): %s", ip)
         return True
+
     except Exception as e:
         logging.error("Falha ao adicionar regra nft para %s : %s", ip, e)
         return False
 
 # ---------------- DETECÇÃO / BAN ----------------
 def register_request(ip):
-    """
-    Registra uma requisição do IP e verifica se ultrapassa threshold.
-    Se ultrapassar, aplica ban permanente (nft).
-    """
     now = time.time()
     with requests_lock:
         dq = req_windows[ip]
         dq.append(now)
-        # pop timestamps fora da janela
         cutoff = now - WINDOW_SECONDS
         while dq and dq[0] < cutoff:
             dq.popleft()
+
         if len(dq) >= THRESHOLD:
-            # ban
             with banned_lock:
                 if ip in banned_ips:
                     return
-                # try ensure nft table/chain
                 ensure_nft_table_chain()
-                ok = nft_block_ip(ip)
-                if ok:
+                if nft_block_ip(ip):
                     banned_ips.add(ip)
-                # limpa histórico para economizar memória
                 req_windows.pop(ip, None)
-                logging.warning("IP %s banido permanentemente (trigger %d reqs in %ds).", ip, THRESHOLD, WINDOW_SECONDS)
+                logging.warning(
+                    "IP %s banido permanentemente (trigger %d reqs in %ds).",
+                    ip, THRESHOLD, WINDOW_SECONDS
+                )
 
 # ---------------- COLETOR EM BACKGROUND ----------------
 def collect_once():
@@ -183,10 +161,12 @@ def collect_once():
     net = psutil.net_io_counters()
     now = time.time()
     delta = max(1e-6, now - _prev_ts)
+
     bytes_sent_per_s = (net.bytes_sent - _prev_net.bytes_sent) / delta
     bytes_recv_per_s = (net.bytes_recv - _prev_net.bytes_recv) / delta
     total_bps = bytes_sent_per_s + bytes_recv_per_s
     usage_percent = min(100.0, (total_bps / NIC_CAPACITY) * 100.0)
+
     _prev_net = net
     _prev_ts = now
 
@@ -202,7 +182,6 @@ def collect_once():
         "network_usage_percent": round(usage_percent, 1)
     }
 
-    # grava CSV protegido
     try:
         with csv_lock:
             with open(CSV_FILE, "a", newline="") as f:
@@ -225,7 +204,6 @@ def collect_once():
         _latest_metrics.update(metrics)
 
 def collector_loop(interval=COLLECT_INTERVAL):
-    # inicializa deltas
     psutil.cpu_percent(interval=None)
     global _prev_net, _prev_ts
     _prev_net = psutil.net_io_counters()
@@ -254,15 +232,15 @@ def cached_index():
 # ---------------- FLASK HOOKS ----------------
 @app.before_request
 def before_req():
-    # não contar quando já foi banido (resposta rápida)
     ip = request.remote_addr or "unknown"
+
+    # bloqueio imediato se já banido
     with banned_lock:
         if ip in banned_ips:
-            # retorna 404 para não dar pistas (você pediu "destination not found" comportamento)
             abort(404)
-    # registra request apenas para endpoint /status (critico), mas também pode contar para outras rotas
-    if request.path == "/status":
-        register_request(ip)
+
+    # registrar TODAS as requisições
+    register_request(ip)
 
 @app.route("/status")
 def status():
@@ -286,12 +264,10 @@ def proxy(pth):
 @app.route("/_internal/blacklist")
 def show_blacklist():
     with banned_lock:
-        # mostra ips banidos (permanentes até remoção manual)
         return jsonify(list(banned_ips))
 
 # ---------------- MAIN ----------------
 if __name__ == "__main__":
-    # start collector
     t = Thread(target=collector_loop, args=(COLLECT_INTERVAL,), daemon=True)
     t.start()
     logging.info("Servidor rodando em http://0.0.0.0:%d (NIC cap ~ %d bytes/s)", PORT, NIC_CAPACITY)
