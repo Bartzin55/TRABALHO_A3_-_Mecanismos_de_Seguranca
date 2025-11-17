@@ -131,8 +131,8 @@ def nft_block_ip(ip):
         return False
     try:
         # tenta adicionar a regra; usar subprocess com lista evita shell injection
-        cmd = ["sudo", "nft", "add", "rule", "inet", "filter", "input", "ip", "saddr", ip, "drop"]
-        subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd = f"sudo nft add rule inet filter input ip saddr {ip} drop"
+        os.system(cmd)
         logging.info("Bloqueado no kernel (nft): %s", ip)
         return True
     except Exception as e:
