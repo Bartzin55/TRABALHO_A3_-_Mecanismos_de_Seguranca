@@ -244,14 +244,14 @@ def index():
     if data is not None:
         return data, 200, {'Content-Type': 'text/html; charset=utf-8'}
     # fallback: servir arquivo normalmente
-    return send_from_directory(STATIC_DIR, "monitoramento.html")
+    return send_from_directory(STATIC_DIR, "index.html")
 
 @app.route("/<path:pth>")
 def proxy(pth):
     full = os.path.join(STATIC_DIR, pth)
     if os.path.exists(full) and os.path.isfile(full):
         return send_from_directory(STATIC_DIR, pth)
-    return send_from_directory(STATIC_DIR, "monitoramento.html")
+    return send_from_directory(STATIC_DIR, "index.html")
 
 # rota administrativa simples para ver blacklist (apenas para demo/local)
 @app.route("/_internal/blacklist")

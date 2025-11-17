@@ -142,14 +142,14 @@ def status():
 
 @app.route("/")
 def index():
-    return send_from_directory(STATIC_DIR, "monitoramento.html")
+    return send_from_directory(STATIC_DIR, "index.html")
 
 @app.route("/<path:pth>")
 def proxy(pth):
     full = os.path.join(STATIC_DIR, pth)
     if os.path.exists(full) and os.path.isfile(full):
         return send_from_directory(STATIC_DIR, pth)
-    return send_from_directory(STATIC_DIR, "monitoramento.html")
+    return send_from_directory(STATIC_DIR, "index.html")
 
 if __name__ == "__main__":
     # iniciar thread coletora
