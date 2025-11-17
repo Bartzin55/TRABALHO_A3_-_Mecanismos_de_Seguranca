@@ -4,7 +4,7 @@ import psutil, time, os, csv
 from threading import Lock, Thread
 
 STATIC_DIR = "site"
-PORT = 8080
+PORT = 8090
 CSV_FILE = "metrics.csv"
 
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
