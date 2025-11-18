@@ -25,15 +25,6 @@ _latest_metrics = {
     "network_usage_percent": 0.0
 }
 
-# CSV init (se não existe)
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "ts","cpu_percent","memory_percent","memory_used_mb","memory_total_mb",
-            "tcp_established","bytes_sent","bytes_recv","network_usage_percent"
-        ])
-
 # variáveis para cálculo de bytes/s
 _prev_net = psutil.net_io_counters()
 _prev_ts = time.time()
@@ -94,26 +85,6 @@ def collect_once():
         "bytes_recv_per_s": round(bytes_recv_per_s, 1),
         "network_usage_percent": round(usage_percent, 1)
     }
-
-    # grava CSV (append) de forma protegida
-    try:
-        with csv_lock:
-            with open(CSV_FILE, "a", newline="") as f:
-                w = csv.writer(f)
-                w.writerow([
-                    ts,
-                    metrics["cpu_percent"],
-                    metrics["memory_percent"],
-                    metrics["memory_used_mb"],
-                    metrics["memory_total_mb"],
-                    tcp_est,
-                    net.bytes_sent,
-                    net.bytes_recv,
-                    metrics["network_usage_percent"]
-                ])
-    except Exception as e:
-        # não interromper: só loga
-        print("Warning: falha ao escrever CSV:", e)
 
     # atualiza snapshot global
     with metrics_lock:
